@@ -1,5 +1,5 @@
-const CACHE_NAME = "panther-books-v2";
-const IMAGE_CACHE = "panther-books-images-v2";
+const CACHE_NAME = "panther-books-v3";
+const IMAGE_CACHE = "panther-books-images-v3";
 
 const APP_SHELL = [
   "./",

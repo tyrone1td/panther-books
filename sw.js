@@ -1,4 +1,6 @@
-const CACHE_NAME = "panther-books-v1";
+const CACHE_NAME = "panther-books-v2";
+const IMAGE_CACHE = "panther-books-images-v2";
+
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -18,7 +20,9 @@ self.addEventListener("activate", event => {
   event.waitUntil(
     caches.keys().then(keys =>
       Promise.all(
-        keys.filter(key => key !== CACHE_NAME).map(key => caches.delete(key))
+        keys
+          .filter(key => key !== CACHE_NAME && key !== IMAGE_CACHE)
+          .map(key => caches.delete(key))
       )
     )
   );
@@ -27,17 +31,38 @@ self.addEventListener("activate", event => {
 
 self.addEventListener("fetch", event => {
   const req = event.request;
-
   if (req.method !== "GET") return;
 
-  // Keep external Inkitt/cover services online-first.
-  if (new URL(req.url).origin !== self.location.origin) {
+  const url = new URL(req.url);
+
+  // Cache resolved external cover artwork after the first successful load.
+  if (url.origin !== self.location.origin && req.destination === "image") {
     event.respondWith(
-      fetch(req).catch(() => new Response("", { status: 503 }))
+      caches.open(IMAGE_CACHE).then(async cache => {
+        const cached = await cache.match(req);
+        if (cached) return cached;
+
+        try {
+          const fresh = await fetch(req);
+          cache.put(req, fresh.clone()).catch(() => {});
+          return fresh;
+        } catch (error) {
+          return new Response("", { status: 503 });
+        }
+      })
     );
     return;
   }
 
+  // Metadata/resolver requests stay network-first.
+  if (url.origin !== self.location.origin) {
+    event.respondWith(
+      fetch(req).catch(() => caches.match(req))
+    );
+    return;
+  }
+
+  // App shell: cache-first.
   event.respondWith(
     caches.match(req).then(cached => {
       return cached || fetch(req).then(response => {

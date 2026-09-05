@@ -559,6 +559,7 @@ function coverShell(book, detail=false) {
     alt="Cover of ${book.title}"
     loading="${detail ? "eager" : "lazy"}"
     decoding="async"
+    fetchpriority="${detail ? "high" : "auto"}"
   >`;
 }
 
@@ -585,18 +586,101 @@ function renderShelf() {
 
   // Start resolving the first few cover URLs in the background so
   // they're ready by the time she swipes to them.
-  prefetchUpcomingCovers(list, 4);
+  prefetchUpcomingCovers(list, list.length);
 }
 
 const coverLookupPromises = new Map();
+const coverWarmQueue = [];
+let coverWarmRunning = 0;
+let MAX_WARM_CONCURRENCY = 5;
+const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+if (connection && connection.effectiveType) {
+  if (/4g/i.test(connection.effectiveType)) MAX_WARM_CONCURRENCY = 7;
+  if (/2g/i.test(connection.effectiveType)) MAX_WARM_CONCURRENCY = 3;
+}
+
+function extractImagesFromReader(text) {
+  if (!text) return [];
+
+  const urls = [];
+
+  // Standard markdown images: ![alt](https://...)
+  for (const match of text.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g)) {
+    urls.push(match[1]);
+  }
+
+  // Some Reader responses may expose raw image URLs.
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>\\)]+?\.(?:jpe?g|png|webp)(?:\?[^\s"'<>\\)]*)?/gi)) {
+    urls.push(match[0]);
+  }
+
+  return [...new Set(urls.map(url => url.replace(/&amp;/g, "&")))];
+}
+
+function chooseBestInkittImage(urls) {
+  const clean = urls.filter(url =>
+    !/logo|avatar|author|profile|emoji|icon|favicon/i.test(url)
+  );
+
+  // Prefer image paths that look like real book artwork rather than social/share cards.
+  return (
+    clean.find(url => /cover|book[_-]?cover|story[_-]?cover/i.test(url)) ||
+    clean.find(url => /inkitt|cloudfront|cdn|image/i.test(url)) ||
+    clean[0] ||
+    null
+  );
+}
+
+async function resolveWithJina(book) {
+  try {
+    const endpoint = "https://r.jina.ai/" + book.inkittUrl;
+    const response = await fetch(endpoint, { cache: "force-cache" });
+    if (!response.ok) throw new Error("Reader cover lookup failed");
+
+    const text = await response.text();
+    const imageUrl = chooseBestInkittImage(extractImagesFromReader(text));
+
+    if (imageUrl) {
+      return imageUrl.replace(/^http:/, "https:");
+    }
+  } catch (error) {
+    console.warn("Reader cover lookup failed for", book.title, error);
+  }
+
+  return null;
+}
+
+async function resolveWithMicrolink(book) {
+  try {
+    const endpoint =
+      "https://api.microlink.io/?url=" +
+      encodeURIComponent(book.inkittUrl) +
+      "&filter=image.url";
+
+    const response = await fetch(endpoint, { cache: "force-cache" });
+    if (!response.ok) throw new Error("Microlink cover lookup failed");
+
+    const payload = await response.json();
+    const imageUrl =
+      payload &&
+      payload.data &&
+      payload.data.image &&
+      payload.data.image.url;
+
+    return imageUrl ? imageUrl.replace(/^http:/, "https:") : null;
+  } catch (error) {
+    return null;
+  }
+}
 
 async function fetchCoverSet(book) {
-  const cacheKey = "inkittCoverV2:" + book.id;
+  const cacheKey = "inkittCoverV5:" + book.id;
 
   try {
     const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
-    if (cached && cached.url) return { small: cached.url, large: cached.url };
-    if (cached && cached.none) return null;
+    if (cached && cached.url) {
+      return { small: cached.url, large: cached.url };
+    }
   } catch (e) {}
 
   if (coverLookupPromises.has(book.id)) {
@@ -604,35 +688,20 @@ async function fetchCoverSet(book) {
   }
 
   const request = (async () => {
-    try {
-      // Microlink reads the Inkitt story page's Open Graph metadata and returns
-      // the actual social/cover artwork. Its browser endpoint supports CORS.
-      const endpoint =
-        "https://api.microlink.io/?url=" +
-        encodeURIComponent(book.inkittUrl) +
-        "&meta=true";
+    // Reader is now the main resolver because it can expose images embedded
+    // in the actual Inkitt story page, not only the social preview.
+    let imageUrl = await resolveWithJina(book);
 
-      const response = await fetch(endpoint, { cache: "force-cache" });
-      if (!response.ok) throw new Error("Cover metadata unavailable");
-
-      const payload = await response.json();
-      const data = payload && payload.data ? payload.data : {};
-
-      let imageUrl =
-        (data.image && data.image.url) ||
-        (data.screenshot && data.screenshot.url) ||
-        null;
-
-      if (imageUrl) {
-        imageUrl = imageUrl.replace(/^http:/, "https:");
-        localStorage.setItem(cacheKey, JSON.stringify({ url: imageUrl }));
-        return { small: imageUrl, large: imageUrl };
-      }
-    } catch (e) {
-      console.warn("Could not load Inkitt cover for", book.title, e);
+    // Lightweight fallback if Reader cannot resolve a particular page.
+    if (!imageUrl) {
+      imageUrl = await resolveWithMicrolink(book);
     }
 
-    localStorage.setItem(cacheKey, JSON.stringify({ none: true }));
+    if (imageUrl) {
+      localStorage.setItem(cacheKey, JSON.stringify({ url: imageUrl }));
+      return { small: imageUrl, large: imageUrl };
+    }
+
     return null;
   })();
 
@@ -645,6 +714,18 @@ async function fetchCoverSet(book) {
   }
 }
 
+function primeImage(url) {
+  return new Promise(resolve => {
+    if (!url) return resolve();
+
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => resolve();
+    img.onerror = () => resolve();
+    img.src = url;
+  });
+}
+
 async function hydrateImage(img) {
   if (!img || img.dataset.loaded === "1") return;
 
@@ -653,11 +734,17 @@ async function hydrateImage(img) {
   if (!book) return;
 
   const covers = await fetchCoverSet(book);
-  if (!covers) return;
+  if (!covers) {
+    img.dataset.loaded = "0";
+    return;
+  }
 
   const quality = img.dataset.quality === "large" ? "large" : "small";
   const url = covers[quality] || covers.large || covers.small;
-  if (!url) return;
+  if (!url) {
+    img.dataset.loaded = "0";
+    return;
+  }
 
   img.onload = () => {
     img.classList.add("loaded");
@@ -679,13 +766,70 @@ async function hydrateImage(img) {
   img.src = url;
 }
 
-function prefetchUpcomingCovers(list, limit = 4) {
-  // Keep prefetch conservative because the free metadata endpoint has a quota.
-  list.slice(0, limit).forEach(book => fetchCoverSet(book));
+async function warmOneCover(book) {
+  const covers = await fetchCoverSet(book);
+  const url = covers && (covers.large || covers.small);
+  if (url) await primeImage(url);
 }
-const coverObserver = new IntersectionObserver(entries => entries.forEach(e => { if(e.isIntersecting) { hydrateImage(e.target); coverObserver.unobserve(e.target); } }), {rootMargin:"420px"});
-function observeCovers(root=document) { root.querySelectorAll("img.real-cover").forEach(img => coverObserver.observe(img)); }
 
+function runCoverWarmQueue() {
+  while (coverWarmRunning < MAX_WARM_CONCURRENCY && coverWarmQueue.length) {
+    const book = coverWarmQueue.shift();
+    coverWarmRunning++;
+
+    warmOneCover(book)
+      .catch(() => {})
+      .finally(() => {
+        coverWarmRunning--;
+        runCoverWarmQueue();
+      });
+  }
+}
+
+function warmCoverCache(list) {
+  const queued = new Set(coverWarmQueue.map(book => book.id));
+
+  list.forEach(book => {
+    if (!queued.has(book.id)) {
+      coverWarmQueue.push(book);
+      queued.add(book.id);
+    }
+  });
+
+  runCoverWarmQueue();
+}
+
+function prioritizeVisibleCovers(root = document) {
+  const imgs = [...root.querySelectorAll("img.real-cover")];
+
+  // First visible books start immediately at full quality.
+  imgs.slice(0, 10).forEach((img, index) => {
+    img.loading = "eager";
+    img.fetchPriority = index < 5 ? "high" : "auto";
+    hydrateImage(img);
+  });
+}
+
+function prefetchUpcomingCovers(list, limit = 100) {
+  // Queue the whole filtered library. Five concurrent workers resolve covers
+  // in the background while the first visible covers receive priority.
+  warmCoverCache(list.slice(0, limit));
+}
+
+const coverObserver = new IntersectionObserver(
+  entries => entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      hydrateImage(entry.target);
+      coverObserver.unobserve(entry.target);
+    }
+  }),
+  { rootMargin: "1800px" }
+);
+
+function observeCovers(root = document) {
+  root.querySelectorAll("img.real-cover").forEach(img => coverObserver.observe(img));
+  prioritizeVisibleCovers(root);
+}
 
 function inkittReadLink(book) {
   const storyUrl = book.inkittUrl;
